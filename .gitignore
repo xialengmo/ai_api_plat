@@ -8,3 +8,6 @@ frontend/node_modules/
 frontend/dist/
 .claude/
 *.log
+.venv313/
+.npm-cache/frontend/--no-audit/
+frontend/--no-audit/
