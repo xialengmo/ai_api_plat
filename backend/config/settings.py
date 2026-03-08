@@ -1,5 +1,5 @@
-# 作者: lxl
-# 说明: 业务模块实现。
+﻿# 作者: lxl
+# 说明: 项目 Django 配置。
 import os
 from pathlib import Path
 
@@ -9,12 +9,18 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, str(default))).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-secret-key")
-DEBUG = os.getenv("DJANGO_DEBUG", "True").lower() == "true"
+DEBUG = _env_bool("DJANGO_DEBUG", True)
 ALLOWED_HOSTS = [
-    h.strip()
-    for h in os.getenv("DJANGO_ALLOWED_HOSTS", "*,127.0.0.1,localhost").split(",")
-    if h.strip()
+    host.strip()
+    for host in os.getenv("DJANGO_ALLOWED_HOSTS", "*,127.0.0.1,localhost").split(",")
+    if host.strip()
 ]
 if DEBUG:
     ALLOWED_HOSTS = ["*"]
@@ -63,9 +69,17 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
 
+_db_engine = os.getenv("DB_ENGINE", "").strip()
+if not _db_engine:
+    _db_engine = (
+        "config.mysql57_backend"
+        if _env_bool("DB_MYSQL57_COMPAT", False)
+        else "django.db.backends.mysql"
+    )
+
 DATABASES = {
     "default": {
-        "ENGINE": "django.db.backends.mysql",
+        "ENGINE": _db_engine,
         "NAME": os.getenv("DB_NAME", "api_test_platform"),
         "USER": os.getenv("DB_USER", "root"),
         "PASSWORD": os.getenv("DB_PASSWORD", "123456"),
