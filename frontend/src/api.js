@@ -221,6 +221,9 @@ export const api = {
   createMonitorPlatform(payload) {
     return request.post("/monitor/platforms", payload, { timeout: MONITOR_DEPLOY_TIMEOUT_MS });
   },
+  checkMonitorPlatformRuntime(payload) {
+    return request.post("/monitor/platforms/runtime-check", payload, { timeout: MONITOR_DEPLOY_TIMEOUT_MS });
+  },
   updateMonitorPlatform(id, payload) {
     return request.put(`/monitor/platforms/${id}`, payload);
   },

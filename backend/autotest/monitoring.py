@@ -81,6 +81,101 @@ def _run_as_root(client, platform: MonitorPlatform, command: str, timeout: int =
     return code2, out2, err2
 
 
+def detect_docker_runtime(platform: MonitorPlatform) -> dict:
+    result = {
+        "ssh_connected": False,
+        "docker_installed": False,
+        "docker_version": "",
+        "docker_compose_installed": False,
+        "docker_compose_command": "",
+        "docker_compose_version": "",
+        "docker_service_status": "",
+        "docker_accessible": False,
+        "docker_access_error": "",
+        "detail": "",
+        "error": "",
+    }
+    try:
+        client = _ssh_connect(platform)
+    except Exception as exc:  # noqa: BLE001
+        message = str(exc or "").strip()
+        result["error"] = message[:300]
+        result["detail"] = f"SSH 连接失败：{message}" if message else "SSH 连接失败"
+        return result
+
+    try:
+        result["ssh_connected"] = True
+
+        code, out, err = _run_remote(client, "docker --version", timeout=10)
+        docker_text = str(out or err or "").strip()
+        if code == 0 and docker_text:
+            result["docker_installed"] = True
+            result["docker_version"] = docker_text.splitlines()[0].strip()[:200]
+
+        compose_cmd = (
+            "if docker compose version >/dev/null 2>&1; then echo '__cmd__:docker compose'; docker compose version; "
+            "elif docker-compose --version >/dev/null 2>&1; then echo '__cmd__:docker-compose'; docker-compose --version; "
+            "else exit 1; fi"
+        )
+        code, out, err = _run_remote(client, compose_cmd, timeout=10)
+        if code == 0:
+            lines = [str(line or "").strip() for line in str(out or "").splitlines() if str(line or "").strip()]
+            if lines:
+                first = lines[0]
+                if first.startswith("__cmd__:"):
+                    result["docker_compose_command"] = first.split(":", 1)[1].strip()
+                    lines = lines[1:]
+            if lines:
+                result["docker_compose_version"] = lines[0][:200]
+            result["docker_compose_installed"] = True
+
+        code, out, _err = _run_remote(
+            client,
+            "if command -v systemctl >/dev/null 2>&1; then systemctl is-active docker 2>/dev/null || true; "
+            "elif command -v service >/dev/null 2>&1; then service docker status 2>/dev/null | head -n 1 || true; "
+            "else echo ''; fi",
+            timeout=10,
+        )
+        service_text = str(out or "").strip()
+        if code == 0 and service_text:
+            result["docker_service_status"] = service_text.splitlines()[0].strip()[:200]
+
+        code, out, err = _run_remote(client, "docker info --format '{{.ServerVersion}}' 2>&1", timeout=15)
+        access_text = str(out or err or "").strip()
+        if code == 0:
+            result["docker_accessible"] = True
+            if not result["docker_version"] and access_text:
+                result["docker_version"] = f"Docker Engine {access_text.splitlines()[0].strip()[:160]}"
+        elif access_text:
+            result["docker_access_error"] = access_text.splitlines()[0].strip()[:240]
+
+        if not result["docker_installed"]:
+            result["detail"] = "未检测到 Docker，保存后部署阶段会尝试自动安装"
+        elif not result["docker_compose_installed"]:
+            result["detail"] = "已检测到 Docker，但未检测到 Docker Compose，部署阶段会尝试自动补装"
+        elif result["docker_accessible"]:
+            result["detail"] = "已检测到可用的 Docker / Compose 环境"
+        else:
+            service_state = str(result.get("docker_service_status") or "").strip()
+            suffix = f"（服务状态：{service_state}）" if service_state else ""
+            result["detail"] = (
+                "已安装 Docker，但当前无法直接访问 Docker Engine，可能是服务未启动或 SSH 账号无 Docker 权限"
+                f"{suffix}"
+            )
+            if not result["error"] and result["docker_access_error"]:
+                result["error"] = result["docker_access_error"]
+    except Exception as exc:  # noqa: BLE001
+        message = str(exc or "").strip()
+        result["error"] = message[:300]
+        result["detail"] = message[:300] or "Docker 环境检测失败"
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+    return result
+
+
 def _is_client_active(client) -> bool:
     try:
         transport = client.get_transport()

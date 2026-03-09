@@ -213,6 +213,8 @@ const monitorForm = reactive({
   deploy_mode: "online",
   target_hosts_text: "",
 });
+const monitorRuntimeCheck = ref(null);
+const monitorRuntimeChecking = ref(false);
 const showUserEditor = ref(false);
 const userForm = reactive({
   id: null,
@@ -1937,6 +1939,74 @@ function resetMonitorForm() {
   monitorForm.ssh_password = "";
   monitorForm.deploy_mode = "online";
   monitorForm.target_hosts_text = "";
+  monitorRuntimeCheck.value = null;
+  monitorRuntimeChecking.value = false;
+}
+
+function buildMonitorSavePayload() {
+  const name = String(monitorForm.name || "").trim();
+  const host = String(monitorForm.host || "").trim();
+  const username = String(monitorForm.ssh_username || "").trim();
+  if (!name || !host || !username) {
+    setError("平台名称、地址、用户名不能为空", "monitor_config");
+    return null;
+  }
+  const platformType = String(monitorForm.platform_type || "single");
+  const monitorTargets = platformType === "host_cluster" ? parseMonitorTargetHostsText(monitorForm.target_hosts_text) : [];
+  if (platformType === "host_cluster" && !monitorTargets.length) {
+    setError("主机集群模式至少需要一个目标主机", "monitor_config");
+    return null;
+  }
+  const payload = {
+    id: monitorForm.id || undefined,
+    name,
+    platform_type: platformType,
+    host,
+    ssh_port: Number(monitorForm.ssh_port || 22),
+    ssh_username: username,
+    deploy_mode: String(monitorForm.deploy_mode || "online"),
+    monitor_targets: monitorTargets,
+    auto_deploy: true,
+  };
+  const password = String(monitorForm.ssh_password || "");
+  if (password.trim()) payload.ssh_password = password;
+  return payload;
+}
+
+function buildMonitorDeployMessage(data, fallback) {
+  if (data?.adopted_existing) {
+    return "检测到平台已安装监控组件，已复用现有组件并刷新采集配置";
+  }
+  const runtime = data?.docker_runtime || {};
+  if (runtime && runtime.ssh_connected === false && runtime.detail) {
+    return `${fallback}；但 Docker 环境检测失败：${runtime.detail}`;
+  }
+  if (runtime && runtime.docker_installed === false) {
+    return `${fallback}；未检测到 Docker，系统已尝试自动安装后继续部署`;
+  }
+  if (runtime?.docker_installed && runtime?.docker_compose_installed === false) {
+    return `${fallback}；已检测到 Docker，但未检测到 Compose，系统已尝试补装后继续部署`;
+  }
+  if (runtime?.docker_installed && runtime?.docker_accessible === false) {
+    return `${fallback}；已检测到 Docker，但当前不可直接访问，系统已继续尝试修复并部署`;
+  }
+  return fallback;
+}
+
+async function checkMonitorPlatformRuntime() {
+  const payload = buildMonitorSavePayload();
+  if (!payload) return;
+  monitorRuntimeChecking.value = true;
+  try {
+    const { data } = await api.checkMonitorPlatformRuntime(payload);
+    monitorRuntimeCheck.value = data || null;
+    setMessage(data?.detail || "Docker 环境检测完成", "monitor_config");
+  } catch (e) {
+    monitorRuntimeCheck.value = null;
+    setError(getApiErrorMessage(e, "Docker 环境检测失败"), "monitor_config");
+  } finally {
+    monitorRuntimeChecking.value = false;
+  }
 }
 
 function openMonitorCreate() {
@@ -1963,46 +2033,17 @@ function closeMonitorEditor() {
 }
 
 async function saveMonitorPlatform() {
-  const name = String(monitorForm.name || "").trim();
-  const host = String(monitorForm.host || "").trim();
-  const username = String(monitorForm.ssh_username || "").trim();
-  if (!name || !host || !username) {
-    return setError("平台名称、地址、用户名不能为空", "monitor_config");
-  }
-  const platformType = String(monitorForm.platform_type || "single");
-  const monitorTargets = platformType === "host_cluster" ? parseMonitorTargetHostsText(monitorForm.target_hosts_text) : [];
-  if (platformType === "host_cluster" && !monitorTargets.length) {
-    return setError("主机集群模式至少需要一个目标主机", "monitor_config");
-  }
-  const payload = {
-    name,
-    platform_type: platformType,
-    host,
-    ssh_port: Number(monitorForm.ssh_port || 22),
-    ssh_username: username,
-    deploy_mode: String(monitorForm.deploy_mode || "online"),
-    monitor_targets: monitorTargets,
-    auto_deploy: true,
-  };
-  const password = String(monitorForm.ssh_password || "");
-  if (password.trim()) payload.ssh_password = password;
+  const payload = buildMonitorSavePayload();
+  if (!payload) return;
   loading.save = true;
   try {
     if (monitorForm.id) {
       await api.updateMonitorPlatform(monitorForm.id, payload);
       const { data } = await api.deployMonitorPlatform(monitorForm.id, { deploy_mode: payload.deploy_mode });
-      if (data?.adopted_existing) {
-        setMessage("检测到平台已安装监控组件，已复用现有组件并刷新采集配置", "monitor_config");
-      } else {
-        setMessage("监控平台已更新并触发部署", "monitor_config");
-      }
+      setMessage(buildMonitorDeployMessage(data, "监控平台已更新并触发部署"), "monitor_config");
     } else {
       const { data } = await api.createMonitorPlatform(payload);
-      if (data?.adopted_existing) {
-        setMessage("检测到平台已安装监控组件，已复用现有组件并刷新采集配置", "monitor_config");
-      } else {
-        setMessage("监控平台已创建并触发部署", "monitor_config");
-      }
+      setMessage(buildMonitorDeployMessage(data, "监控平台已创建并触发部署"), "monitor_config");
     }
     closeMonitorEditor();
     await loadMonitorPlatforms();
@@ -2027,11 +2068,7 @@ async function removeMonitorPlatform(item) {
 async function redeployMonitorPlatform(item) {
   try {
     const { data } = await api.deployMonitorPlatform(item.id, { deploy_mode: item?.deploy_mode || "online" });
-    if (data?.adopted_existing) {
-      setMessage(`平台「${item?.name || "-"}」检测到现有组件，已改为复用并刷新配置`, "monitor_config");
-    } else {
-      setMessage(`已触发平台「${item?.name || "-"}」重新部署`, "monitor_config");
-    }
+    setMessage(buildMonitorDeployMessage(data, `已触发平台「${item?.name || "-"}」重新部署`), "monitor_config");
     await loadMonitorPlatforms();
   } catch (e) {
     setError(getApiErrorMessage(e, "触发部署失败"), "monitor_config");
@@ -3065,6 +3102,31 @@ watch(
                 <el-radio label="online">联网部署</el-radio>
                 <el-radio label="offline">离线包部署（需先上传离线包）</el-radio>
               </el-radio-group>
+            </label>
+            <label class="full">
+              <span>Docker 环境检测</span>
+              <div class="card" style="width:100%;">
+                <div class="card-body" style="padding:12px;">
+                  <div class="actions-inline" style="justify-content:space-between; gap:12px; flex-wrap:wrap;">
+                    <el-button :loading="monitorRuntimeChecking" @click="checkMonitorPlatformRuntime">
+                      {{ monitorRuntimeChecking ? "检测中..." : "检测 Docker 环境" }}
+                    </el-button>
+                    <span class="sub">{{ monitorRuntimeCheck?.detail || "保存前可先检测目标机是否已安装 Docker / Compose。" }}</span>
+                  </div>
+                  <div v-if="monitorRuntimeCheck" class="actions-inline" style="margin-top:10px; gap:8px; flex-wrap:wrap;">
+                    <span :class="['tag', monitorRuntimeCheck.ssh_connected ? 'pass' : 'bad']">SSH {{ monitorRuntimeCheck.ssh_connected ? '已连接' : '失败' }}</span>
+                    <span :class="['tag', monitorRuntimeCheck.docker_installed ? 'pass' : 'warn']">Docker {{ monitorRuntimeCheck.docker_installed ? '已安装' : '未安装' }}</span>
+                    <span :class="['tag', monitorRuntimeCheck.docker_compose_installed ? 'pass' : 'warn']">Compose {{ monitorRuntimeCheck.docker_compose_installed ? '已安装' : '未安装' }}</span>
+                    <span :class="['tag', monitorRuntimeCheck.docker_accessible ? 'pass' : 'warn']">引擎 {{ monitorRuntimeCheck.docker_accessible ? '可访问' : '不可访问' }}</span>
+                  </div>
+                  <div v-if="monitorRuntimeCheck" class="sub" style="margin-top:8px; display:grid; gap:4px;">
+                    <div v-if="monitorRuntimeCheck.docker_version">Docker：{{ monitorRuntimeCheck.docker_version }}</div>
+                    <div v-if="monitorRuntimeCheck.docker_compose_version">Compose：{{ monitorRuntimeCheck.docker_compose_version }}</div>
+                    <div v-if="monitorRuntimeCheck.docker_service_status">服务状态：{{ monitorRuntimeCheck.docker_service_status }}</div>
+                    <div v-if="monitorRuntimeCheck.error">错误详情：{{ monitorRuntimeCheck.error }}</div>
+                  </div>
+                </div>
+              </div>
             </label>
             <label class="full">
               <span>监控目标主机</span>

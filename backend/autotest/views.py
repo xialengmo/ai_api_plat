@@ -34,7 +34,7 @@ from autotest.executor import (
     preview_scenario_steps,
     _case_to_dict,
 )
-from autotest.monitoring import deploy_monitor_platform
+from autotest.monitoring import deploy_monitor_platform, detect_docker_runtime
 from autotest.models import (
     ApiModule,
     LoginAuditLog,
@@ -1594,6 +1594,9 @@ def monitor_platform_list_create(request):
     auto_deploy = _as_bool(request.data.get("auto_deploy"), True)
     adopted_existing = False
     detected_components = {}
+    docker_runtime = _monitor_docker_runtime_payload(platform, source_payload=request.data)
+    _append_docker_runtime_log(platform, docker_runtime)
+    platform.save(update_fields=["deploy_logs", "updated_at"])
     if auto_deploy:
         adopted_existing, detected_components = _adopt_existing_monitoring_stack(platform, trigger="create")
         if not adopted_existing:
@@ -1602,6 +1605,7 @@ def monitor_platform_list_create(request):
     payload = MonitorPlatformSerializer(platform).data
     payload["adopted_existing"] = adopted_existing
     payload["detected_components"] = detected_components
+    payload["docker_runtime"] = docker_runtime
     return Response(payload, status=status.HTTP_201_CREATED)
 
 
@@ -1653,6 +1657,9 @@ def monitor_platform_deploy(request, platform_id: int):
         platform.save(update_fields=["deploy_mode", "updated_at"])
     adopted_existing = False
     detected_components = {}
+    docker_runtime = _monitor_docker_runtime_payload(platform, source_payload=request.data)
+    _append_docker_runtime_log(platform, docker_runtime)
+    platform.save(update_fields=["deploy_logs", "updated_at"])
     if platform.deploy_mode == MonitorPlatform.DEPLOY_MODE_ONLINE:
         adopted_existing, detected_components = _adopt_existing_monitoring_stack(platform, trigger="manual")
     if not adopted_existing:
@@ -1661,6 +1668,7 @@ def monitor_platform_deploy(request, platform_id: int):
     payload = MonitorPlatformSerializer(platform).data
     payload["adopted_existing"] = adopted_existing
     payload["detected_components"] = detected_components
+    payload["docker_runtime"] = docker_runtime
     return Response(payload)
 
 
@@ -1707,6 +1715,27 @@ def monitor_platform_upload_package(request, platform_id: int):
     return Response(MonitorPlatformSerializer(platform).data)
 
 
+@api_view(["POST"])
+def monitor_platform_runtime_check(request):
+    forbidden = _ensure_admin_user(request)
+    if forbidden:
+        return forbidden
+
+    instance = None
+    raw_id = request.data.get("id") or request.data.get("platform_id")
+    if raw_id not in {None, ""}:
+        try:
+            instance = get_object_or_404(MonitorPlatform, id=int(raw_id))
+        except (TypeError, ValueError):
+            return Response({"detail": "平台 ID 非法"}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        probe = _build_monitor_runtime_probe(request.data, instance=instance)
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(detect_docker_runtime(probe))
+
+
 @api_view(["GET"])
 def monitor_platform_status(request, platform_id: int):
     platform = get_object_or_404(MonitorPlatform, id=platform_id)
@@ -1723,6 +1752,7 @@ def monitor_platform_status(request, platform_id: int):
             "alertmanager_url": platform.alertmanager_url,
             "last_error": platform.last_error,
             "last_deployed_at": _fmt_dt(platform.last_deployed_at),
+            "docker_runtime": _monitor_docker_runtime_payload(platform),
         }
     )
 
@@ -1833,16 +1863,88 @@ def _append_monitor_log(platform: MonitorPlatform, message: str, level: str = "i
     platform.deploy_logs = logs
 
 
+def _build_monitor_runtime_probe(payload, instance=None) -> MonitorPlatform:
+    source = payload.copy() if hasattr(payload, "copy") else dict(payload or {})
+    host = str(source.get("host") or (instance.host if instance else "")).strip()
+    ssh_username = str(source.get("ssh_username") or (instance.ssh_username if instance else "")).strip()
+    raw_password = source.get("ssh_password")
+    ssh_password = str(raw_password or "")
+    if not ssh_password and instance is not None:
+        ssh_password = str(instance.ssh_password or "")
+    try:
+        ssh_port = int(source.get("ssh_port") or (instance.ssh_port if instance else 22) or 22)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError("ssh_port 必须是整数") from exc
+
+    if ssh_port <= 0 or ssh_port > 65535:
+        raise ValueError("ssh_port 取值范围为 1-65535")
+    if not host or not ssh_username:
+        raise ValueError("服务器地址、用户名不能为空")
+    if not ssh_password:
+        raise ValueError("请填写 SSH 密码，或先保存平台后使用已保存密码检测")
+
+    return MonitorPlatform(
+        id=getattr(instance, "id", None),
+        name=str(source.get("name") or (instance.name if instance else "runtime-check") or "runtime-check").strip() or "runtime-check",
+        platform_type=str(source.get("platform_type") or (instance.platform_type if instance else MonitorPlatform.PLATFORM_TYPE_SINGLE)).strip() or MonitorPlatform.PLATFORM_TYPE_SINGLE,
+        host=host,
+        ssh_port=ssh_port,
+        ssh_username=ssh_username,
+        ssh_password=ssh_password,
+        deploy_mode=str(source.get("deploy_mode") or (instance.deploy_mode if instance else MonitorPlatform.DEPLOY_MODE_ONLINE)).strip() or MonitorPlatform.DEPLOY_MODE_ONLINE,
+    )
+
+
+def _monitor_docker_runtime_payload(platform: MonitorPlatform, source_payload=None) -> dict:
+    try:
+        probe = _build_monitor_runtime_probe(source_payload or {}, instance=platform)
+    except ValueError as exc:
+        detail = str(exc or "").strip() or "Docker 环境检测失败"
+        return {
+            "ssh_connected": False,
+            "docker_installed": False,
+            "docker_version": "",
+            "docker_compose_installed": False,
+            "docker_compose_command": "",
+            "docker_compose_version": "",
+            "docker_service_status": "",
+            "docker_accessible": False,
+            "docker_access_error": "",
+            "detail": detail,
+            "error": detail,
+        }
+    return detect_docker_runtime(probe)
+
+
+def _append_docker_runtime_log(platform: MonitorPlatform, runtime_info: dict) -> None:
+    if not isinstance(runtime_info, dict):
+        return
+    detail = str(runtime_info.get("detail") or "").strip()
+    if not detail:
+        return
+    prefix = "Docker 环境检测"
+    if runtime_info.get("docker_accessible"):
+        _append_monitor_log(platform, f"{prefix}: {detail}")
+    elif runtime_info.get("ssh_connected"):
+        _append_monitor_log(platform, f"{prefix}: {detail}", level="warning")
+    else:
+        _append_monitor_log(platform, f"{prefix}: {detail}", level="error")
+
+
 def _detect_monitor_components(platform: MonitorPlatform):
     # 关键逻辑说明(lxl): 新平台接入前先探测目标机是否已有监控组件，
     # 避免重复安装并为“复用已有监控栈”提供判定依据。
+    runtime_info = detect_docker_runtime(platform)
     detected = {
-        "docker_available": False,
+        "docker_available": bool(runtime_info.get("docker_accessible")),
+        "docker_runtime": runtime_info,
         "prometheus": False,
         "alertmanager": False,
         "node_exporter": False,
         "cadvisor": False,
     }
+    if not runtime_info.get("docker_accessible"):
+        return detected
     try:
         from autotest.monitoring import _run_remote, _ssh_connect
     except Exception:
@@ -1854,8 +1956,6 @@ def _detect_monitor_components(platform: MonitorPlatform):
         return detected
     try:
         code, out, _err = _run_remote(client, "docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null || true", timeout=20)
-        if code == 0:
-            detected["docker_available"] = True
         lines = [str(line or "").strip().lower() for line in str(out or "").splitlines() if str(line or "").strip()]
         for line in lines:
             parts = line.split(" ", 1)

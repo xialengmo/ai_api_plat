@@ -40,6 +40,7 @@ urlpatterns = [
     path("environments", views.environment_list),
     path("environments/<int:env_id>", views.environment_detail),
     path("monitor/platforms", views.monitor_platform_list_create),
+    path("monitor/platforms/runtime-check", views.monitor_platform_runtime_check),
     path("monitor/platforms/<int:platform_id>", views.monitor_platform_detail),
     path("monitor/platforms/<int:platform_id>/deploy", views.monitor_platform_deploy),
     path("monitor/platforms/<int:platform_id>/upload-package", views.monitor_platform_upload_package),
