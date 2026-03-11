@@ -7,3 +7,4 @@ python-dotenv>=1.0
 PyYAML>=6.0
 jsonpath-ng>=1.6
 paramiko>=3.4
+gunicorn>=21.2

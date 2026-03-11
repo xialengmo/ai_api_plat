@@ -6,7 +6,7 @@
 - 后端：`Django 4.2` + `Django REST Framework`
 - 数据库：`MySQL`
 - HTTP / 解析能力：`httpx`、`PyYAML`、`jsonpath-ng`
-- 远程部署 / 监控接入：`paramiko`
+- 远程部署 / 监控接入 / 容器化：`paramiko`、`gunicorn`、`nginx`、`Docker Compose`
 
 ## 核心能力
 
@@ -69,9 +69,18 @@
 
 ### 8. 监控平台接入
 
-- 监控平台配置、部署、日志查看、状态检查
-- 目标主机管理
+- Docker 运行时检测：保存或部署前可检测目标机的 SSH、Docker、Compose 与引擎访问状态
+- 监控平台配置、在线部署、离线包部署、部署日志查看、状态检查
+- 已有监控栈复用：检测到目标机已存在 Prometheus / Alertmanager / Exporter 时优先复用并刷新采集配置
+- Docker / Compose 自愈：缺失时自动安装，常见证书或软件源异常时尝试自动纠错
+- 目标主机管理：支持单机与主机集群模式，自动生成 Prometheus 抓取目标
 - 最新指标与历史趋势查询
+
+### 9. 部署与交付
+
+- Linux 一键部署：提供 `deploy/linux_oneclick.sh`，自动完成环境安装、数据库初始化、前后端构建与服务注册
+- Docker 微服务部署：提供 `db`、`backend`、`frontend`、`nginx` 四容器编排模板
+- 容器启动入口：后端容器自动等待数据库、执行 `migrate`、`collectstatic` 并通过 `gunicorn` 对外提供服务
 
 ## 快速开始
 
@@ -199,7 +208,73 @@ AI_TIMEOUT_SECONDS=60
 - 切换完成后请重新启动后端服务
 - 若后续统一升级到更高版本 `Django`，仍需重新验证依赖兼容性
 
-## 8. 推荐使用流程
+## 8. Linux 一键部署
+
+适用于新 Linux 机器的快速落地部署，入口脚本为 [deploy/linux_oneclick.sh](C:/Users/华硕/PycharmProjects/ai_plat/deploy/linux_oneclick.sh)。
+
+脚本会自动完成以下动作：
+
+- 识别 `apt` / `dnf` / `yum` 系系统，并按需重写系统源到阿里云镜像
+- 安装 `git`、`nginx`、`mysql/mariadb`、`python3`、`nodejs`
+- 生成 `backend/.env` 和 `frontend/.env.production.local`
+- 初始化数据库、安装 Python / Node.js 依赖、执行 `migrate`
+- 构建前端静态资源，并注册 `systemd + gunicorn + nginx`
+
+最小示例：
+
+```bash
+chmod +x deploy/linux_oneclick.sh
+sudo DOMAIN=test.example.com SERVER_IP=192.168.1.10 DB_PASSWORD=ChangeMe_123456 DEFAULT_ADMIN_PASSWORD=ChangeMe_123456 bash deploy/linux_oneclick.sh
+```
+
+常用环境变量：
+
+- `DOMAIN` / `SERVER_IP`：用于生成站点访问地址、`ALLOWED_HOSTS` 与 CORS
+- `DB_NAME`、`DB_USER`、`DB_PASSWORD`：数据库初始化参数
+- `DJANGO_SECRET_KEY`、`DJANGO_DEBUG`、`DEFAULT_ADMIN_*`：Django 与初始管理员配置
+- `AI_BASE_URL`、`AI_API_KEY`、`AI_MODEL`：AI 生成能力配置
+- `ENABLE_MIRROR_REWRITE=false`：关闭阿里云镜像源改写
+
+部署完成后，前端通过 Nginx 暴露，后端健康检查地址默认为 `http://127.0.0.1:8000/api/health`。
+
+## 9. Docker 微服务部署
+
+当前仓库提供 [docker-compose.microservices.yml](C:/Users/华硕/PycharmProjects/ai_plat/docker-compose.microservices.yml) 作为标准容器化部署入口，包含：
+
+- `db`：`MySQL 8`，自动执行 [sql/init_mysql.sql](C:/Users/华硕/PycharmProjects/ai_plat/sql/init_mysql.sql)
+- `backend`：基于 [backend/Dockerfile](C:/Users/华硕/PycharmProjects/ai_plat/backend/Dockerfile) 构建，启动时执行 [backend/docker/entrypoint.sh](C:/Users/华硕/PycharmProjects/ai_plat/backend/docker/entrypoint.sh)
+- `frontend`：基于 [frontend/Dockerfile](C:/Users/华硕/PycharmProjects/ai_plat/frontend/Dockerfile) 构建静态站点
+- `nginx`：加载 [deploy/nginx/gateway.conf](C:/Users/华硕/PycharmProjects/ai_plat/deploy/nginx/gateway.conf)，统一转发 `/`、`/api/` 与 `/static/`
+
+启动步骤：
+
+```bash
+cp deploy/docker/.env.example .env
+docker compose --env-file .env -f docker-compose.microservices.yml up -d --build
+```
+
+建议至少修改以下变量：
+
+- `DJANGO_SECRET_KEY`
+- `MYSQL_ROOT_PASSWORD`
+- `DB_PASSWORD`
+- `DEFAULT_ADMIN_PASSWORD`
+- `DJANGO_ALLOWED_HOSTS`
+- `DJANGO_CORS_ALLOWED_ORIGINS`
+- `AI_API_KEY`
+
+常用运维命令：
+
+```bash
+docker compose -f docker-compose.microservices.yml ps
+docker compose -f docker-compose.microservices.yml logs -f backend
+docker compose -f docker-compose.microservices.yml logs -f nginx
+docker compose -f docker-compose.microservices.yml down
+```
+
+容器部署模式下，后端会自动等待数据库、执行迁移，并在 `DJANGO_COLLECTSTATIC=1` 时将静态文件收集到 `STATIC_ROOT=/app/staticfiles`，再由网关容器统一暴露。
+
+## 10. 推荐使用流程
 
 1. 进入“项目管理”，先创建项目
 2. 为项目创建“环境”，配置环境地址、默认 Header、环境变量
@@ -318,6 +393,7 @@ AI_TIMEOUT_SECONDS=60
 - `GET /api/dashboard/summary`
 - `GET /api/rbac/overview`
 - `GET/POST /api/monitor/platforms`
+- `POST /api/monitor/platforms/runtime-check`
 - `POST /api/monitor/platforms/{id}/deploy`
 - `POST /api/monitor/platforms/{id}/upload-package`
 - `GET /api/monitor/platforms/{id}/status`
@@ -331,9 +407,11 @@ AI_TIMEOUT_SECONDS=60
 监控管理操作仅允许管理员执行。典型流程如下：
 
 1. 在“监控配置”中新建监控平台，填写主机、SSH 账号密码、部署方式
-2. 选择在线部署，或上传离线包后部署
-3. 根据平台类型配置单机或多个目标主机
-4. 部署成功后，在“资源监控”页面查看最新指标和历史趋势
+2. 保存前可先执行 Docker 环境检测，确认目标机是否已安装 Docker / Compose，以及当前 SSH 账号是否可访问 Docker Engine
+3. 选择在线部署，或上传离线包后部署
+4. 根据平台类型配置单机或多个目标主机；若目标机已有监控组件，系统会优先复用现有栈并刷新采集配置
+5. 在线部署时若缺少 Docker / Compose，系统会尝试自动安装；遇到常见证书或软件源问题时会尝试自动纠错
+6. 部署成功后，在“资源监控”页面查看最新指标和历史趋势
 
 ## 适用场景
 
