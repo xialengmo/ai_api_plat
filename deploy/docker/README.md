@@ -1,19 +1,19 @@
-# Docker Microservice Deployment
+﻿# Docker 微服务部署
 
-This deployment mode splits the project into 4 containers:
+该部署方式会把项目拆成 4 个容器：
 
-- `frontend`: Vite build output served by Nginx
-- `backend`: Django + Gunicorn API container
-- `nginx`: gateway container for `/`, `/api/`, and `/static/`
-- `db`: MySQL 8 container
+- `frontend`：前端静态资源容器，由 Nginx 提供页面访问
+- `backend`：`Django + Gunicorn` API 容器
+- `nginx`：统一网关容器，负责转发 `/`、`/api/` 和 `/static/`
+- `db`：`MySQL 8` 容器
 
-## 1. Prepare environment variables
+## 1. 准备环境变量
 
 ```bash
 cp deploy/docker/.env.example .env
 ```
 
-Update at least these values:
+建议至少修改以下配置：
 
 - `DJANGO_SECRET_KEY`
 - `MYSQL_ROOT_PASSWORD`
@@ -23,18 +23,18 @@ Update at least these values:
 - `DJANGO_CORS_ALLOWED_ORIGINS`
 - `AI_API_KEY`
 
-If users access the site through `http://your-domain`, a typical setup is:
+如果用户通过 `http://your-domain` 访问，典型配置如下：
 
 - `DJANGO_ALLOWED_HOSTS=your-domain,localhost,127.0.0.1`
 - `DJANGO_CORS_ALLOWED_ORIGINS=http://your-domain`
 
-## 2. Start the stack
+## 2. 启动整套服务
 
 ```bash
 docker compose --env-file .env -f docker-compose.microservices.yml up -d --build
 ```
 
-## 3. Check status
+## 3. 查看运行状态
 
 ```bash
 docker compose -f docker-compose.microservices.yml ps
@@ -42,36 +42,37 @@ docker compose -f docker-compose.microservices.yml logs -f backend
 docker compose -f docker-compose.microservices.yml logs -f nginx
 ```
 
-## 4. Access URLs
+## 4. 访问地址
 
-- Frontend: `http://server-ip/`
-- Backend health check: `http://server-ip/api/health`
+- 前端入口：`http://server-ip/`
+- 后端健康检查：`http://server-ip/api/health`
 
-## 5. Stop the stack
+## 5. 停止服务
 
 ```bash
 docker compose -f docker-compose.microservices.yml down
 ```
 
-Remove data volumes as well:
+如果连数据卷一起删除：
 
 ```bash
 docker compose -f docker-compose.microservices.yml down -v
 ```
 
-## 6. Architecture notes
+## 6. 架构说明
 
-- Browsers only talk to the `nginx` gateway container.
-- `nginx` proxies `/api/` to `backend:8000`.
-- `nginx` serves `/static/` from the shared backend static volume.
-- `nginx` proxies `/` to `frontend:80`.
-- `backend` connects to `db:3306` over the Docker network.
-- The frontend build uses `VITE_API_BASE_URL=/api`.
-- The backend container waits for MySQL, runs `migrate`, and can run `collectstatic` before starting Gunicorn.
+- 浏览器只访问 `nginx` 网关容器
+- `nginx` 会将 `/api/` 转发到 `backend:8000`
+- `nginx` 会将 `/static/` 映射到后端共享出来的静态文件卷
+- `nginx` 会将 `/` 转发到 `frontend:80`
+- `backend` 通过 Docker 网络访问 `db:3306`
+- 前端构建时固定使用 `VITE_API_BASE_URL=/api`
+- 后端容器启动时会等待 MySQL，执行 `migrate`，并在需要时执行 `collectstatic` 后再启动 Gunicorn
 
-## 7. Production suggestions
+## 7. 生产环境建议
 
-- Set `FRONTEND_PORT=80`, or reverse proxy the gateway to `443`.
-- Add TLS certificates in front of the gateway container.
-- If you use an external MySQL instance, remove the `db` service and point `DB_HOST` to the real address.
-- Keep the `backend_storage` volume if you need persistent uploads or offline packages.
+- 将 `FRONTEND_PORT` 设为 `80`，或在宿主机 / 负载均衡层反向代理到 `443`
+- 在网关容器前补充 TLS 证书
+- 如果使用外部 MySQL，可以移除 `db` 服务，并把 `DB_HOST` 指向实际数据库地址
+- 如果需要持久化上传文件或离线包，请保留 `backend_storage` 数据卷
+

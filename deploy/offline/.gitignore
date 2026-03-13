@@ -1,0 +1,9 @@
+*
+!.gitignore
+!README.md
+!os-packages/
+!os-packages/.gitkeep
+!python/
+!python/.gitkeep
+!frontend-dist/
+!frontend-dist/.gitkeep

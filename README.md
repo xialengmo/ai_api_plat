@@ -78,8 +78,9 @@
 
 ### 9. 部署与交付
 
-- Linux 一键部署：提供 `deploy/linux_oneclick.sh`，自动完成环境安装、数据库初始化、前后端构建与服务注册
+- Linux 一键部署：提供 `deploy/linux_oneclick.sh`，同时支持联网安装与离线包部署
 - Docker 微服务部署：提供 `db`、`backend`、`frontend`、`nginx` 四容器编排模板
+- Docker 单镜像部署：提供 `Dockerfile.single`，由同一镜像内的 `nginx + gunicorn` 对外提供完整应用
 - 容器启动入口：后端容器自动等待数据库、执行 `migrate`、`collectstatic` 并通过 `gunicorn` 对外提供服务
 
 ## 快速开始
@@ -233,9 +234,120 @@ sudo DOMAIN=test.example.com SERVER_IP=192.168.1.10 DB_PASSWORD=ChangeMe_123456 
 - `DB_NAME`、`DB_USER`、`DB_PASSWORD`：数据库初始化参数
 - `DJANGO_SECRET_KEY`、`DJANGO_DEBUG`、`DEFAULT_ADMIN_*`：Django 与初始管理员配置
 - `AI_BASE_URL`、`AI_API_KEY`、`AI_MODEL`：AI 生成能力配置
+- `OFFLINE_MODE=true`：启用离线部署模式，从 `deploy/offline` 读取本地包
+- `OFFLINE_DIR`：自定义离线包根目录
 - `ENABLE_MIRROR_REWRITE=false`：关闭阿里云镜像源改写
 
 部署完成后，前端通过 Nginx 暴露，后端健康检查地址默认为 `http://127.0.0.1:8000/api/health`。
+
+### 离线部署方式
+
+适用于目标机无法访问公网，但你可以提前手动下载依赖包并拷到项目目录的场景。
+
+推荐流程是“目标机先探测，有网机再准备”：
+
+```bash
+# 第 1 步：在目标机执行，生成画像文件
+chmod +x deploy/probe_target_env.sh
+bash deploy/probe_target_env.sh
+
+# 第 2 步：把 deploy/offline/target-profile.env 带到有网机器后执行
+chmod +x deploy/prepare_offline_bundle.sh
+sudo bash deploy/prepare_offline_bundle.sh
+```
+
+说明：
+
+- [deploy/probe_target_env.sh](C:/Users/华硕/PycharmProjects/ai_plat/deploy/probe_target_env.sh) 会自动识别目标机的系统、包管理器、架构，以及是否已安装 `nginx`、数据库客户端、`Python 3.8+`
+- [deploy/prepare_offline_bundle.sh](C:/Users/华硕/PycharmProjects/ai_plat/deploy/prepare_offline_bundle.sh) 会读取 `deploy/offline/target-profile.env`，自动决定默认要下载哪些离线资源
+- 如果有网准备机和目标机不是同一包管理器家族，例如准备机是 `apt` 而目标机是 `yum`，脚本会阻止自动下载 OS 包；这时应在同类系统上准备，或用 `SKIP_OS_PACKAGES=true` 只准备 wheel 和前端产物
+
+离线目录约定如下：
+
+```text
+deploy/offline/
+├─ os-packages/        # 可选，系统包：apt 用 .deb，yum/dnf 用 .rpm
+├─ python/             # 必需，后端依赖 wheel 文件
+├─ frontend-dist/      # 可选，前端 dist 目录
+└─ frontend-dist.tar.gz # 推荐，前端构建产物压缩包
+```
+
+离线模式最少需要准备：
+
+- `deploy/offline/python/`：包含后端依赖的 `.whl` 文件，至少覆盖 `backend/requirements.txt` 中所有包
+- `deploy/offline/frontend-dist.tar.gz` 或 `deploy/offline/frontend-dist/index.html`：前端构建产物
+
+如果目标机连 `python3`、`nginx`、`mysql/mariadb` 都没有，再额外准备：
+
+- `deploy/offline/os-packages/`：对应系统的本地安装包集合
+
+推荐在有网机器上准备前端构建产物：
+
+```bash
+cd frontend
+npm install
+npm run build
+tar -czf ../deploy/offline/frontend-dist.tar.gz -C dist .
+```
+
+推荐在有网机器上准备 Python wheel：
+
+```bash
+python -m pip download -r backend/requirements.txt -d deploy/offline/python
+python -m pip download gunicorn -d deploy/offline/python
+```
+
+也可以直接在一台有网、且尽量与目标机同系统的大版本 Linux 上执行：
+
+```bash
+chmod +x deploy/prepare_offline_bundle.sh
+sudo bash deploy/prepare_offline_bundle.sh
+```
+
+该脚本会自动完成：
+
+- 下载 `deploy/offline/python/` 下的后端 wheel
+- 构建并打包 `deploy/offline/frontend-dist.tar.gz`
+- 下载 `deploy/offline/os-packages/` 下的系统包
+
+说明：
+
+- `apt` / `dnf` 环境会默认尝试下载 Python 运行时包
+- `yum` 环境会根据目标画像自动判断是否需要 `nginx` / `mariadb`，但如果目标缺少 `python3.8+`，通常仍需要你在 `deploy/offline/target-profile.env` 里补 `TARGET_PYTHON_PACKAGE_HINTS`
+- 例如 `CentOS 7` 可尝试：`TARGET_PYTHON_PACKAGE_HINTS="python38 python38-pip python38-setuptools"`
+
+离线部署命令：
+
+```bash
+chmod +x deploy/linux_oneclick.sh
+sudo OFFLINE_MODE=true DOMAIN=test.example.com SERVER_IP=192.168.1.10 DB_PASSWORD=ChangeMe_123456 DEFAULT_ADMIN_PASSWORD=ChangeMe_123456 bash deploy/linux_oneclick.sh
+```
+
+离线模式下脚本行为如下：
+
+- 跳过镜像源改写、pip 镜像配置、npm registry 配置
+- 若 `deploy/offline/os-packages/` 下存在本地系统包，则优先从本地安装
+- 后端通过 `pip install --no-index --find-links=...` 安装 wheel
+- 前端不再执行 `npm build`，而是直接解压 `frontend-dist.tar.gz`
+
+常见故障排查：
+
+- 如果出现 `curl: (6) Could not resolve host: mirrors.aliyun.com`，这不是脚本逻辑失败，而是目标机器当前 DNS 不可用
+- 先检查 `/etc/resolv.conf` 是否存在可用 `nameserver`
+- 可临时写入：
+
+```bash
+cat >/etc/resolv.conf <<'EOF'
+nameserver 223.5.5.5
+nameserver 223.6.6.6
+EOF
+getent hosts mirrors.aliyun.com
+```
+
+- 确认能解析后再重新执行一键部署
+- `ENABLE_MIRROR_REWRITE=false` 只能关闭镜像源改写，本身不能修复 DNS 故障
+- 如果离线模式报 `Offline mode requires Python wheels`，说明 [deploy/offline/python](C:/Users/华硕/PycharmProjects/ai_plat/deploy/offline/python) 下缺少 `.whl`
+- 如果离线模式报 `Frontend dist archive must contain index.html`，说明前端压缩包目录层级不对，需保证根目录或 `dist/` 目录下直接有 `index.html`
 
 ## 9. Docker 微服务部署
 
@@ -274,7 +386,49 @@ docker compose -f docker-compose.microservices.yml down
 
 容器部署模式下，后端会自动等待数据库、执行迁移，并在 `DJANGO_COLLECTSTATIC=1` 时将静态文件收集到 `STATIC_ROOT=/app/staticfiles`，再由网关容器统一暴露。
 
-## 10. 推荐使用流程
+## 10. Docker 单镜像部署
+
+如果你希望最终只交付一个应用镜像，而不是前后端多个业务容器，可以使用以下文件：
+
+- [Dockerfile.single](C:/Users/华硕/PycharmProjects/ai_plat/Dockerfile.single)
+- [docker-compose.single-image.yml](C:/Users/华硕/PycharmProjects/ai_plat/docker-compose.single-image.yml)
+- [deploy/single-image/nginx.conf](C:/Users/华硕/PycharmProjects/ai_plat/deploy/single-image/nginx.conf)
+- [deploy/single-image/entrypoint.sh](C:/Users/华硕/PycharmProjects/ai_plat/deploy/single-image/entrypoint.sh)
+
+该模式的结构是：
+
+- `app`：单个应用镜像，内部运行 `nginx + gunicorn`
+- `db`：可选的独立 `MySQL 8` 容器；也可以替换成外部 MySQL
+
+启动示例：
+
+```bash
+cp deploy/single-image/.env.example .env
+docker compose --env-file .env -f docker-compose.single-image.yml up -d --build
+```
+
+镜像构建和运行逻辑：
+
+- 构建阶段使用 `Node.js` 打包前端静态资源
+- 运行阶段使用 `Python 3.11 + Nginx`
+- 容器启动时自动等待数据库、执行 `migrate`、执行 `collectstatic`
+- `nginx` 直接服务前端页面，并将 `/api/` 代理到容器内的 `gunicorn`
+- `/static/` 由同一容器内的 `nginx` 直接映射 Django 收集后的静态文件
+
+如需接外部 MySQL：
+
+- 删除或忽略 `db` 服务
+- 把 `DB_HOST` 改成外部数据库地址
+- 保持 `DB_PORT`、`DB_USER`、`DB_PASSWORD`、`DB_NAME` 与目标库一致
+- 如果数据库在容器外部，首次启动前请确认防火墙和白名单已放通
+
+单镜像模式更适合：
+
+- 需要把业务应用交付为一个镜像
+- 前端、后端和网关希望统一版本发布
+- 数据库可以独立托管在外部或单独容器中
+
+## 11. 推荐使用流程
 
 1. 进入“项目管理”，先创建项目
 2. 为项目创建“环境”，配置环境地址、默认 Header、环境变量

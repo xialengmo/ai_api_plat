@@ -46,6 +46,14 @@ AI_TIMEOUT_SECONDS="${AI_TIMEOUT_SECONDS:-60}"
 SYSTEMD_SERVICE="${SYSTEMD_SERVICE:-${APP_NAME}-backend}"
 NGINX_SITE_NAME="${NGINX_SITE_NAME:-${APP_NAME}}"
 
+OFFLINE_MODE="${OFFLINE_MODE:-false}"
+OFFLINE_DIR="${OFFLINE_DIR:-${PROJECT_ROOT}/deploy/offline}"
+OFFLINE_OS_PACKAGE_DIR="${OFFLINE_OS_PACKAGE_DIR:-${OFFLINE_DIR}/os-packages}"
+OFFLINE_PYTHON_WHEEL_DIR="${OFFLINE_PYTHON_WHEEL_DIR:-${OFFLINE_DIR}/python}"
+OFFLINE_FRONTEND_DIST_DIR="${OFFLINE_FRONTEND_DIST_DIR:-${OFFLINE_DIR}/frontend-dist}"
+OFFLINE_FRONTEND_DIST_ARCHIVE="${OFFLINE_FRONTEND_DIST_ARCHIVE:-${OFFLINE_DIR}/frontend-dist.tar.gz}"
+OFFLINE_FRONTEND_DIST_TGZ="${OFFLINE_FRONTEND_DIST_TGZ:-${OFFLINE_DIR}/frontend-dist.tgz}"
+
 ENABLE_MIRROR_REWRITE="${ENABLE_MIRROR_REWRITE:-true}"
 APT_MIRROR_BASE="${APT_MIRROR_BASE:-https://mirrors.aliyun.com}"
 YUM_MIRROR_BASE="${YUM_MIRROR_BASE:-https://mirrors.aliyun.com}"
@@ -56,6 +64,7 @@ NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmmirror.com}"
 PKG_MANAGER=""
 PYTHON_BIN="python3"
 DB_SERVICE=""
+MYSQL_BIN="mysql"
 OS_ID=""
 OS_ID_LIKE=""
 OS_VERSION_ID=""
@@ -78,6 +87,21 @@ is_true() {
     1|true|yes|on) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+is_offline_mode() {
+  is_true "${OFFLINE_MODE}"
+}
+
+command_exists_any() {
+  local cmd=""
+  for cmd in "$@"; do
+    if command -v "${cmd}" >/dev/null 2>&1; then
+      printf '%s' "${cmd}"
+      return 0
+    fi
+  done
+  return 1
 }
 
 ensure_root() {
@@ -146,8 +170,70 @@ backup_dir() {
   printf '%s' "$target"
 }
 
+has_matching_files() {
+  local dir="$1"
+  local pattern="$2"
+  [[ -d "${dir}" ]] || return 1
+
+  shopt -s nullglob
+  local files=("${dir}"/${pattern})
+  shopt -u nullglob
+  (( ${#files[@]} > 0 ))
+}
+
+frontend_dist_available() {
+  if [[ -f "${OFFLINE_FRONTEND_DIST_ARCHIVE}" || -f "${OFFLINE_FRONTEND_DIST_TGZ}" ]]; then
+    return 0
+  fi
+  [[ -f "${OFFLINE_FRONTEND_DIST_DIR}/index.html" ]]
+}
+
+extract_host_from_url() {
+  local url="$1"
+  url="${url#*://}"
+  url="${url%%/*}"
+  url="${url%%\?*}"
+  url="${url%%\#*}"
+  url="${url%%:*}"
+  printf '%s' "$url"
+}
+
+can_resolve_host() {
+  local host="$1"
+  [[ -n "${host}" ]] || return 0
+
+  if command -v getent >/dev/null 2>&1; then
+    getent ahostsv4 "${host}" >/dev/null 2>&1 || getent hosts "${host}" >/dev/null 2>&1
+    return $?
+  fi
+
+  return 0
+}
+
+ensure_host_resolvable() {
+  local host="$1"
+  local purpose="${2:-network access}"
+  [[ -n "${host}" ]] || return 0
+
+  if can_resolve_host "${host}"; then
+    return 0
+  fi
+
+  local nameservers=""
+  if [[ -f /etc/resolv.conf ]]; then
+    nameservers="$(grep -E '^[[:space:]]*nameserver[[:space:]]+' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | xargs || true)"
+  fi
+
+  if [[ -n "${nameservers}" ]]; then
+    fatal "DNS resolution failed for ${host} (${purpose}). Current nameservers: ${nameservers}. Fix DNS first, for example set nameserver 223.5.5.5 and 223.6.6.6 in /etc/resolv.conf, verify with 'getent hosts ${host}', then rerun the script."
+  fi
+
+  fatal "DNS resolution failed for ${host} (${purpose}). No nameserver was found in /etc/resolv.conf. Add a working DNS server such as 223.5.5.5 and 223.6.6.6, verify with 'getent hosts ${host}', then rerun the script."
+}
+
 configure_apt_mirrors() {
   log "Configuring Aliyun mirror for apt (${OS_PRETTY_NAME})"
+  ensure_host_resolvable "$(extract_host_from_url "${APT_MIRROR_BASE}")" "APT mirror"
 
   local apt_backup
   apt_backup="$(backup_dir /etc/apt)"
@@ -277,6 +363,7 @@ EOF
 
 configure_yum_mirrors() {
   log "Configuring Aliyun mirror for ${PKG_MANAGER} (${OS_PRETTY_NAME})"
+  ensure_host_resolvable "$(extract_host_from_url "${YUM_MIRROR_BASE}")" "YUM/DNF mirror"
 
   local yum_backup
   yum_backup="$(backup_dir /etc/yum.repos.d)"
@@ -314,6 +401,11 @@ configure_yum_mirrors() {
 }
 
 configure_system_mirrors() {
+  if is_offline_mode; then
+    log "Offline mode is enabled, skip mirror rewrite"
+    return
+  fi
+
   if ! is_true "${ENABLE_MIRROR_REWRITE}"; then
     log "Mirror rewrite is disabled"
     return
@@ -329,7 +421,62 @@ configure_system_mirrors() {
   esac
 }
 
+install_base_packages_offline() {
+  log "Offline mode: installing local system packages from ${OFFLINE_OS_PACKAGE_DIR} when available"
+
+  local pattern=""
+  case "${PKG_MANAGER}" in
+    apt)
+      pattern="*.deb"
+      ;;
+    dnf|yum)
+      pattern="*.rpm"
+      ;;
+  esac
+
+  if ! has_matching_files "${OFFLINE_OS_PACKAGE_DIR}" "${pattern}"; then
+    log "Offline mode: no local system packages found, assume required base packages are already installed"
+    return
+  fi
+
+  shopt -s nullglob
+  local files=("${OFFLINE_OS_PACKAGE_DIR}"/${pattern})
+  shopt -u nullglob
+
+  case "${PKG_MANAGER}" in
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      retry_cmd 3 5 apt-get install -y "${files[@]}"
+      ;;
+    dnf)
+      retry_cmd 3 5 dnf install -y "${files[@]}"
+      ;;
+    yum)
+      retry_cmd 3 5 yum localinstall -y "${files[@]}"
+      ;;
+  esac
+}
+
+verify_offline_prerequisites() {
+  local missing=()
+
+  command_exists_any python3 python3.11 python3.10 python3.9 python3.8 >/dev/null || missing+=("python3.8+")
+  command -v nginx >/dev/null 2>&1 || missing+=("nginx")
+  command_exists_any mysql mariadb >/dev/null || missing+=("mysql/mariadb client")
+  command -v systemctl >/dev/null 2>&1 || missing+=("systemctl")
+
+  if (( ${#missing[@]} > 0 )); then
+    fatal "Offline mode requires preinstalled base packages or local packages under ${OFFLINE_OS_PACKAGE_DIR}. Missing: ${missing[*]}"
+  fi
+}
+
 install_base_packages() {
+  if is_offline_mode; then
+    install_base_packages_offline
+    verify_offline_prerequisites
+    return
+  fi
+
   case "${PKG_MANAGER}" in
     apt)
       export DEBIAN_FRONTEND=noninteractive
@@ -345,13 +492,8 @@ install_base_packages() {
 }
 
 ensure_python() {
-  command -v python3 >/dev/null 2>&1 || fatal "python3 is required"
-
-  if command -v python3.11 >/dev/null 2>&1; then
-    PYTHON_BIN="python3.11"
-  else
-    PYTHON_BIN="python3"
-  fi
+  PYTHON_BIN="$(command_exists_any python3.11 python3.10 python3.9 python3.8 python3 || true)"
+  [[ -n "${PYTHON_BIN}" ]] || fatal "python3.8+ is required"
 
   "${PYTHON_BIN}" - <<'PY'
 import sys
@@ -369,6 +511,14 @@ PY
 }
 
 ensure_nodejs() {
+  if is_offline_mode; then
+    if frontend_dist_available; then
+      log "Offline mode: using prebuilt frontend dist, skip Node.js installation"
+      return
+    fi
+    fatal "Offline mode requires ${OFFLINE_FRONTEND_DIST_ARCHIVE} (or ${OFFLINE_FRONTEND_DIST_DIR}/index.html) because Node.js online installation is disabled"
+  fi
+
   if command -v node >/dev/null 2>&1; then
     NODE_MAJOR="$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo 0)"
   else
@@ -381,14 +531,17 @@ ensure_nodejs() {
   log "Installing Node.js 20"
   case "${PKG_MANAGER}" in
     apt)
+      ensure_host_resolvable "deb.nodesource.com" "NodeSource APT bootstrap"
       retry_cmd 3 5 bash -lc "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -"
       retry_cmd 3 5 apt-get install -y nodejs
       ;;
     dnf)
+      ensure_host_resolvable "rpm.nodesource.com" "NodeSource RPM bootstrap"
       retry_cmd 3 5 bash -lc "curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -"
       retry_cmd 3 5 dnf install -y nodejs
       ;;
     yum)
+      ensure_host_resolvable "rpm.nodesource.com" "NodeSource RPM bootstrap"
       retry_cmd 3 5 bash -lc "curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -"
       retry_cmd 3 5 yum install -y nodejs
       ;;
@@ -413,8 +566,13 @@ configure_database_service() {
   systemctl enable --now "${DB_SERVICE}"
 }
 
+detect_mysql_client() {
+  MYSQL_BIN="$(command_exists_any mysql mariadb || true)"
+  [[ -n "${MYSQL_BIN}" ]] || fatal "mysql/mariadb client was not found"
+}
+
 configure_database() {
-  mysql <<SQL
+  "${MYSQL_BIN}" <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS '${DB_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_PASSWORD}';
 CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
@@ -497,6 +655,14 @@ EOF
 }
 
 configure_language_mirrors() {
+  if is_offline_mode; then
+    log "Offline mode: skip pip/npm mirror configuration"
+    return
+  fi
+
+  ensure_host_resolvable "$(extract_host_from_url "${PIP_INDEX_URL}")" "pip index"
+  ensure_host_resolvable "$(extract_host_from_url "${NPM_REGISTRY}")" "npm registry"
+
   cat > /etc/pip.conf <<EOF
 [global]
 index-url = ${PIP_INDEX_URL}
@@ -514,6 +680,15 @@ EOF
 
 setup_backend() {
   run_as_app "cd '${BACKEND_DIR}' && ${PYTHON_BIN} -m venv .venv"
+
+  if is_offline_mode; then
+    has_matching_files "${OFFLINE_PYTHON_WHEEL_DIR}" "*.whl" || fatal "Offline mode requires Python wheels under ${OFFLINE_PYTHON_WHEEL_DIR}"
+    retry_cmd 3 5 run_as_app "cd '${BACKEND_DIR}' && . .venv/bin/activate && pip install --no-index --find-links='${OFFLINE_PYTHON_WHEEL_DIR}' -r requirements.txt gunicorn"
+    run_as_app "cd '${BACKEND_DIR}' && . .venv/bin/activate && python manage.py migrate"
+    run_as_app "cd '${BACKEND_DIR}' && . .venv/bin/activate && python manage.py check"
+    return
+  fi
+
   retry_cmd 3 5 run_as_app "cd '${BACKEND_DIR}' && . .venv/bin/activate && PIP_INDEX_URL='${PIP_INDEX_URL}' pip install -U pip setuptools wheel"
   retry_cmd 3 5 run_as_app "cd '${BACKEND_DIR}' && . .venv/bin/activate && PIP_INDEX_URL='${PIP_INDEX_URL}' pip install -r requirements.txt gunicorn"
   run_as_app "cd '${BACKEND_DIR}' && . .venv/bin/activate && python manage.py migrate"
@@ -528,6 +703,40 @@ EOF
 }
 
 build_frontend() {
+  if is_offline_mode; then
+    local temp_dir=""
+    local source_dir=""
+
+    rm -rf "${FRONTEND_DIR}/dist"
+    mkdir -p "${FRONTEND_DIR}/dist"
+
+    if [[ -f "${OFFLINE_FRONTEND_DIST_ARCHIVE}" || -f "${OFFLINE_FRONTEND_DIST_TGZ}" ]]; then
+      local archive_path="${OFFLINE_FRONTEND_DIST_ARCHIVE}"
+      if [[ ! -f "${archive_path}" ]]; then
+        archive_path="${OFFLINE_FRONTEND_DIST_TGZ}"
+      fi
+      temp_dir="$(mktemp -d)"
+      tar -xzf "${archive_path}" -C "${temp_dir}"
+      if [[ -f "${temp_dir}/index.html" ]]; then
+        source_dir="${temp_dir}"
+      elif [[ -f "${temp_dir}/dist/index.html" ]]; then
+        source_dir="${temp_dir}/dist"
+      else
+        rm -rf "${temp_dir}"
+        fatal "Frontend dist archive must contain index.html at root or under dist/"
+      fi
+      cp -a "${source_dir}/." "${FRONTEND_DIR}/dist/"
+      rm -rf "${temp_dir}"
+    elif [[ -f "${OFFLINE_FRONTEND_DIST_DIR}/index.html" ]]; then
+      cp -a "${OFFLINE_FRONTEND_DIST_DIR}/." "${FRONTEND_DIR}/dist/"
+    else
+      fatal "Offline mode requires ${OFFLINE_FRONTEND_DIST_ARCHIVE} or ${OFFLINE_FRONTEND_DIST_DIR}/index.html"
+    fi
+
+    chown -R "${RUN_USER}:${RUN_GROUP}" "${FRONTEND_DIR}/dist"
+    return
+  fi
+
   retry_cmd 3 5 run_as_app "cd '${FRONTEND_DIR}' && npm install --registry '${NPM_REGISTRY}'"
   run_as_app "cd '${FRONTEND_DIR}' && npm run build"
 }
@@ -630,6 +839,9 @@ main() {
 
   load_os_release
   detect_pkg_manager
+  if is_offline_mode; then
+    log "Offline mode is enabled, local assets root: ${OFFLINE_DIR}"
+  fi
   configure_system_mirrors
 
   log "Installing system packages"
@@ -643,6 +855,7 @@ main() {
   configure_database_service
 
   log "Configuring database"
+  detect_mysql_client
   configure_database
 
   log "Configuring pip/npm mirrors"
